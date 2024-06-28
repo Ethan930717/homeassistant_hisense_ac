@@ -1,0 +1,13 @@
+{
+  "domain": "hisense_ac",
+  "name": "Hisense AC",
+  "version": "1.0",
+  "documentation": "https://github.com/Ethan930717/homeassistant_hisense_ac",
+  "dependencies": [],
+  "codeowners": [],
+  "requirements": ["requests"],
+  "config_flow": true
+}
+
+
+
