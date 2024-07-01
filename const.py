@@ -1,5 +1,6 @@
 DOMAIN = "hisense_ac"
 DATA_FILE = "hisense_data.json"
+SCAN_INTERVAL = timedelta(seconds=5)
 
 # API Constants
 BASE_URL = "https://1app.hicloud.hisensehitachi.com"
