@@ -1,52 +1,68 @@
 import logging
 from homeassistant.components.climate import ClimateEntity
 from homeassistant.components.climate.const import (
-    HVAC_MODE_OFF,
-    HVAC_MODE_COOL,
-    HVAC_MODE_HEAT,
-    SUPPORT_TARGET_TEMPERATURE
-)
-from homeassistant.const import TEMP_CELSIUS
-from .const import CONTROL_ENDPOINT, HEADERS, DOMAIN
+    HVAC_MODE_OFF, HVAC_MODE_COOL, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY, HVAC_MODE_HEAT,
+    SUPPORT_FAN_MODE, SUPPORT_TARGET_TEMPERATURE)
+from homeassistant.const import TEMP_CELSIUS, ATTR_TEMPERATURE
+
+from .const import DOMAIN, FAN_MODE_HIGH, FAN_MODE_MEDIUM, FAN_MODE_LOW
 from .hisense_api import get_status, control_ac
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
-    _LOGGER.debug("Setting up climate platform")
-    coordinator = hass.data[DOMAIN]["coordinator"]
-    devices = coordinator.data
+
+async def async_setup_entry(hass, config_entry, async_add_entities):
+    config = hass.data[DOMAIN][config_entry.entry_id]
+    token = config["token"]
+    home_id = config["home_id"]
+    devices = config["devices"]
+    status_list = get_status(token, home_id, devices)
+    iu_map = map_iuIds_to_names(devices)
 
     entities = []
-    for device in devices:
-        entities.append(HisenseAC(coordinator, device))
-    async_add_entities(entities)
+    for status in status_list:
+        for iu_status in status['values']:
+            iuId = iu_status.get('iuId')
+            iuName = iu_map.get(iuId, '未知')
+            entities.append(HisenseACClimate(token, home_id, iuName, iu_status, devices))
 
-class HisenseAC(ClimateEntity):
-    def __init__(self, coordinator, device):
-        self.coordinator = coordinator
-        self.device = device
-        self._name = device["name"]
-        self._unique_id = device["id"]
-        self._state = HVAC_MODE_OFF
-        self._temperature = None
-        _LOGGER.debug("Initialized Hisense AC: %s", self._name)
+    async_add_entities(entities, True)
 
-    @property
-    def supported_features(self):
-        return SUPPORT_TARGET_TEMPERATURE
 
-    @property
-    def hvac_modes(self):
-        return [HVAC_MODE_OFF, HVAC_MODE_COOL, HVAC_MODE_HEAT]
+class HisenseACClimate(ClimateEntity):
+    def __init__(self, token, home_id, name, status, devices):
+        self._token = token
+        self._home_id = home_id
+        self._name = name
+        self._status = status
+        self._devices = devices
+        self._device = next(
+            (device for device in devices if any(iu['iuId'] == status['iuId'] for iu in device['iuList'])), None)
+
+        self._hvac_mode = self._status.get('iu29Mode')
+        self._fan_mode = self._status.get('iu30Wind')
+        self._target_temperature = self._status.get('iu31Temp')
+        self._onoff = self._status.get('iu28Onoff')
 
     @property
     def name(self):
         return self._name
 
     @property
-    def unique_id(self):
-        return self._unique_id
+    def hvac_mode(self):
+        return self._hvac_mode
+
+    @property
+    def hvac_modes(self):
+        return [HVAC_MODE_OFF, HVAC_MODE_COOL, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY, HVAC_MODE_HEAT]
+
+    @property
+    def fan_mode(self):
+        return self._fan_mode
+
+    @property
+    def fan_modes(self):
+        return [FAN_MODE_HIGH, FAN_MODE_MEDIUM, FAN_MODE_LOW]
 
     @property
     def temperature_unit(self):
@@ -54,46 +70,40 @@ class HisenseAC(ClimateEntity):
 
     @property
     def target_temperature(self):
-        return self._temperature
+        return self._target_temperature
+
+    @property
+    def supported_features(self):
+        return SUPPORT_FAN_MODE | SUPPORT_TARGET_TEMPERATURE
+
+    @property
+    def is_on(self):
+        return self._onoff == 1
 
     async def async_set_hvac_mode(self, hvac_mode):
-        token_data = self.coordinator.hass.data[DOMAIN].get("token_data")
-        result = await self.coordinator.hass.async_add_executor_job(
-            control_ac, token_data["token"], token_data["home_id"], self.device, hvac_mode=hvac_mode
-        )
-        if result:
-            self._state = hvac_mode
+        await self.hass.async_add_executor_job(control_ac, self._token, self._home_id, self._device,
+                                               hvac_mode=hvac_mode)
+        self._hvac_mode = hvac_mode
+
+    async def async_set_fan_mode(self, fan_mode):
+        await self.hass.async_add_executor_job(control_ac, self._token, self._home_id, self._device, fan_mode=fan_mode)
+        self._fan_mode = fan_mode
+        self.async_write_ha_state()
+
+    async def async_set_temperature(self, **kwargs):
+        temperature = kwargs.get(ATTR_TEMPERATURE)
+        if temperature is not None:
+            await self.hass.async_add_executor_job(control_ac, self._token, self._home_id, self._device,
+                                                   temperature=temperature)
+            self._target_temperature = temperature
             self.async_write_ha_state()
 
-    async def async_update(self):
-        _LOGGER.debug("Updating Hisense AC: %s", self._name)
-        token_data = self.coordinator.hass.data[DOMAIN].get("token_data")
-        status = await self.coordinator.hass.async_add_executor_job(
-            get_status, token_data["token"], token_data["home_id"], self.device
-        )
-        if status:
-            _LOGGER.info(f"Status for {self._name}: {status}")
-            values = status.get('values', [])
-            if values:
-                value = values[0]
-                _LOGGER.debug(f"Device status value: {value}")
-                self._state = value.get("iu28Onoff")
-                self._temperature = value.get("iu31Temp")
-                self._hvac_mode = self.map_hvac_mode(value.get("iu29Mode"))
-                self._fan_mode = self.map_fan_mode(value.get("iu30Wind"))
+    async def async_turn_on(self):
+        await self.async_set_hvac_mode(self._hvac_mode)
+        self._onoff = 1
+        self.async_write_ha_state()
 
-    def map_hvac_mode(self, hvac_mode):
-        return {
-            0: HVAC_MODE_OFF,
-            1: HVAC_MODE_COOL,
-            2: HVAC_MODE_DRY,
-            3: HVAC_MODE_FAN_ONLY,
-            4: HVAC_MODE_HEAT
-        }.get(hvac_mode, HVAC_MODE_OFF)
-
-    def map_fan_mode(self, fan_mode):
-        return {
-            1: "high",
-            2: "medium",
-            3: "low"
-        }.get(fan_mode, "low")
+    async def async_turn_off(self):
+        await self.async_set_hvac_mode(HVAC_MODE_OFF)
+        self._onoff = 0
+        self.async_write_ha_state()

@@ -1,75 +1,46 @@
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
-from homeassistant.helpers import config_validation as cv
-
+import homeassistant.helpers.config_validation as cv
 from .const import DOMAIN
-from .token_store import save_token
-from .hisense_api import try_login, get_device_list
-
-_LOGGER = logging.getLogger(__name__)
-
-@callback
-def configured_instances(hass):
-    return [entry.entry_id for entry in hass.config_entries.async_entries(DOMAIN)]
+from .hisense_api import try_login, get_device_list, save_data
 
 class HisenseACConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
+    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
 
     async def async_step_user(self, user_input=None):
-        errors = {}
         if user_input is not None:
-            phone_no = user_input["phone_no"]
-            password = user_input["password"]
-            _LOGGER.debug("User input received: phone_no=%s", phone_no)
-
             try:
-                token, home_id, error = await self.hass.async_add_executor_job(
-                    try_login, phone_no, password
-                )
-
+                token, home_id = await self.hass.async_add_executor_job(try_login, user_input["phone_no"], user_input["password"])
                 if token:
-                    _LOGGER.debug("Login successful: token=%s, home_id=%s", token, home_id)
-                    save_token(self.hass, token, home_id)
-                    return await self.async_step_select_device()
+                    home_detail, devices = await self.hass.async_add_executor_job(get_device_list, token, home_id)
+                    await self.hass.async_add_executor_job(save_data, home_detail, devices)
+                    return self.async_create_entry(title="Hisense AC", data={"token": token, "home_id": home_id, "devices": devices})
                 else:
-                    _LOGGER.error("Login failed: %s", error)
-                    errors["base"] = error or "unknown_error"
+                    errors = {"base": "auth"}
+                    return self.async_show_form(step_id="user", data_schema=self._get_schema(), errors=errors)
             except Exception as e:
-                _LOGGER.exception("Unexpected exception during login")
-                errors["base"] = str(e)
+                _LOGGER.error(f"Error during login: {e}")
+                errors = {"base": "auth"}
+                return self.async_show_form(step_id="user", data_schema=self._get_schema(), errors=errors)
 
-        data_schema = vol.Schema({
+        return self.async_show_form(step_id="user", data_schema=self._get_schema())
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(config_entry):
+        return HisenseACOptionsFlowHandler(config_entry)
+
+    def _get_schema(self):
+        return vol.Schema({
             vol.Required("phone_no"): str,
             vol.Required("password"): str
         })
 
-        return self.async_show_form(
-            step_id="user", data_schema=data_schema, errors=errors
-        )
+class HisenseACOptionsFlowHandler(config_entries.OptionsFlow):
+    def __init__(self, config_entry):
+        self.config_entry = config_entry
 
-    async def async_step_select_device(self, user_input=None):
-        errors = {}
-        token_data = load_token(self.hass)
-
-        if user_input is not None:
-            selected_devices = user_input["devices"]
-            self.hass.data[DOMAIN]["selected_devices"] = selected_devices
-            return self.async_create_entry(
-                title="Hisense AC",
-                data={"selected_devices": selected_devices}
-            )
-
-        devices = await self.hass.async_add_executor_job(
-            get_device_list, token_data["token"], token_data["home_id"]
-        )
-
-        device_dict = {device["name"]: device["id"] for device in devices}
-
-        data_schema = vol.Schema({
-            vol.Required("devices"): cv.multi_select(device_dict)
-        })
-
-        return self.async_show_form(
-            step_id="select_device", data_schema=data_schema, errors=errors
-        )
+    async def async_step_init(self, user_input=None):
+        return self.async_show_form(step_id="init", data_schema=vol.Schema({}))
